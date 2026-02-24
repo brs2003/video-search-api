@@ -1,33 +1,26 @@
 import os
 import time
 import tempfile
+import json
 import yt_dlp
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import google.generativeai as genai
 
-# Configure Gemini
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 app = FastAPI()
 
-# Request model
 class AskRequest(BaseModel):
     video_url: str
     topic: str
 
 
-# Download audio only
 def download_audio(video_url: str, output_path: str):
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio",
         "outtmpl": output_path,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-        "quiet": True
+        "quiet": True,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -36,22 +29,18 @@ def download_audio(video_url: str, output_path: str):
 
 @app.post("/ask")
 def ask(data: AskRequest):
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
     temp_file.close()
 
     try:
-        # Step 1: Download audio
         download_audio(data.video_url, temp_file.name)
 
-        # Step 2: Upload to Gemini Files API
         file = genai.upload_file(temp_file.name)
 
-        # Step 3: Poll until ACTIVE
         while file.state.name != "ACTIVE":
             time.sleep(2)
             file = genai.get_file(file.name)
 
-        # Step 4: Call Gemini with structured output
         model = genai.GenerativeModel("gemini-2.0-flash")
 
         response = model.generate_content(
@@ -74,10 +63,10 @@ def ask(data: AskRequest):
             }
         )
 
-        result = response.text
+        parsed = json.loads(response.text)
 
         return {
-            "timestamp": eval(result)["timestamp"],
+            "timestamp": parsed["timestamp"],
             "video_url": data.video_url,
             "topic": data.topic
         }
@@ -86,12 +75,11 @@ def ask(data: AskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        # Step 5: Cleanup
         if os.path.exists(temp_file.name):
-
             os.remove(temp_file.name)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
