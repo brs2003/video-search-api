@@ -5,13 +5,12 @@ from google import genai
 from google.genai import types
 import yt_dlp
 import os
-import re
 import time
 import uuid
 
 app = FastAPI()
 
-# Enable CORS
+# CORS (required for validator)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,32 +19,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure Gemini
+# Gemini client
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Request model (MUST match assignment)
+# Request model (must match validator)
 class AskRequest(BaseModel):
     video_url: str
     topic: str
 
 
-# Extract YouTube video ID
-def extract_video_id(url: str):
-    pattern = r"(?:v=|youtu\.be/)([^&]+)"
-    match = re.search(pattern, url)
-    if not match:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
-    return match.group(1)
-
-
-# Download audio only using yt-dlp
-def download_audio(video_url: str, output_path: str):
+# Download AUDIO ONLY (very important)
+def download_audio(video_url: str, output_filename: str):
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": output_path,
+        "outtmpl": output_filename,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "extractaudio": True,
+        "audioformat": "mp3",
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -57,13 +49,16 @@ def ask(request: AskRequest):
     temp_filename = f"{uuid.uuid4()}.mp3"
 
     try:
-        # Step 1: Download audio
+        # STEP 1 — Download audio
         download_audio(request.video_url, temp_filename)
 
-        # Step 2: Upload to Gemini Files API
+        if not os.path.exists(temp_filename):
+            raise HTTPException(status_code=500, detail="Audio download failed")
+
+        # STEP 2 — Upload to Gemini Files API
         uploaded_file = client.files.upload(file=temp_filename)
 
-        # Step 3: Poll until file becomes ACTIVE
+        # STEP 3 — Wait until ACTIVE
         while uploaded_file.state.name == "PROCESSING":
             time.sleep(2)
             uploaded_file = client.files.get(name=uploaded_file.name)
@@ -71,7 +66,7 @@ def ask(request: AskRequest):
         if uploaded_file.state.name != "ACTIVE":
             raise HTTPException(status_code=500, detail="File processing failed")
 
-        # Step 4: Structured output schema
+        # STEP 4 — Structured schema
         response_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -83,12 +78,12 @@ def ask(request: AskRequest):
             required=["timestamp"],
         )
 
-        # Step 5: Ask Gemini to find timestamp
+        # STEP 5 — Ask Gemini
         response = client.models.generate_content(
             model="gemini-2.0-flash",
             contents=[
                 uploaded_file,
-                f"Find the FIRST time the topic '{request.topic}' is spoken in this audio. "
+                f"Find the FIRST time the topic '{request.topic}' is spoken. "
                 "Return ONLY the timestamp in HH:MM:SS format."
             ],
             config=types.GenerateContentConfig(
@@ -97,10 +92,14 @@ def ask(request: AskRequest):
             ),
         )
 
-        result = response.parsed
+        # Safer parsing
+        if not response.parsed:
+            raise HTTPException(status_code=500, detail="Gemini parsing failed")
+
+        timestamp = response.parsed["timestamp"]
 
         return {
-            "timestamp": result["timestamp"],
+            "timestamp": timestamp,
             "video_url": request.video_url,
             "topic": request.topic
         }
@@ -109,6 +108,6 @@ def ask(request: AskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        # Step 6: Clean up temp file
+        # STEP 6 — Cleanup
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
