@@ -88,4 +88,10 @@ def ask(data: AskRequest):
     finally:
         # Step 5: Cleanup
         if os.path.exists(temp_file.name):
+
             os.remove(temp_file.name)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=10000)
